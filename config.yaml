@@ -1,0 +1,43 @@
+# Camera settings
+camera:
+  device_id: 0
+  width: 640
+  height: 480
+  fps_target: 30
+
+# Detection settings
+detection:
+  model: "yolo11n.pt"
+  device: "cpu"
+  confidence: 0.35
+  iou: 0.4
+  max_det: 10
+
+# Tracking settings
+tracking:
+  max_age: 30
+  min_hits: 1
+  iou_threshold: 0.25
+
+# OCR settings
+ocr:
+  languages: ["en"]
+  gpu: false
+  min_confidence: 0.3
+
+# Scene Captioning settings
+captioning:
+  model: "Salesforce/blip-image-captioning-base"
+  device: "cpu"
+  max_length: 30
+  min_length: 5
+
+# TTS settings
+tts:
+  rate: 150
+  volume: 0.9
+
+# Logging
+logging:
+  level: "INFO"
+  show_fps: true
