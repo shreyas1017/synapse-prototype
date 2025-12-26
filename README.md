@@ -130,7 +130,7 @@ python main.py
 ## 📊 Performance Metrics
 
 | Metric | Current (CPU) | Target (Pi + Optimization) |
-|--------|---------------|----------------------------|
+|--------|--------------|----------------------------|
 | Detection FPS | 9 FPS | 15-20 FPS |
 | Tracking FPS | 4-5 FPS | 10-15 FPS |
 | OCR Latency | 2-3s | <2s |
@@ -226,7 +226,7 @@ python test_caption.py
 ## 🛠️ Technology Stack
 
 | Component | Technology |
-|-----------|------------|
+|-----------|-----------|
 | Object Detection | YOLOv11-Nano (Ultralytics) |
 | Tracking | SORT / DeepSORT |
 | OCR | EasyOCR + Tesseract |
