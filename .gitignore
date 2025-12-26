@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+synapse-env/
+venv/
+ENV/
+env/
+
+# Models (large files)
+*.pt
+*.pth
+*.onnx
+*.tflite
+models/
+*.h5
+*.pb
+
+# EasyOCR cache
+.EasyOCR/
+
+# HuggingFace cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.jpg
+*.png
+*.jpeg
+*.mp4
+*.avi
+ocr_capture_*.jpg
+ocr_result_*.jpg
+
+# Logs
+*.log
+synapse.log
+
+# Config (if contains sensitive data)
+# config.yaml  # Uncomment if you want to exclude config
