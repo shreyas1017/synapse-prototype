@@ -169,23 +169,24 @@ python main.py
 ```
 synapse-prototype/
 ├── src/
+│   ├── vision/
+│   │   ├── tracker.py         # YOLOv11 + ByteTrack
+│   │   ├── distance_estimator.py  # Monocular distance estimation
+│   │   ├── spatial_layout.py  # Left/ahead/right zone detection
+│   │   ├── scene_memory.py    # Short-term scene memory
+│   │   ├── ocr.py             # EasyOCR wrapper
+│   │   └── captioner.py       # BLIP wrapper
 │   ├── io/
 │   │   ├── camera.py          # Threaded camera capture
-│   │   ├── tts_output.py      # Text-to-speech engine
-│   │   └── audio_input.py     # Microphone input (planned)
-│   ├── vision/
-│   │   ├── detector.py        # YOLOv11 wrapper
-│   │   ├── tracker.py         # DeepSORT wrapper
-│   │   ├── simple_tracker.py  # Lightweight tracker
-│   │   ├── ocr.py             # EasyOCR wrapper
-│   │   ├── captioner.py       # BLIP wrapper
-│   │   └── face_emotion.py    # Face recognition (planned)
-│   ├── logic/
-│   │   ├── output_generator.py # Natural language generation
-│   │   └── command_processor.py # Command parsing (planned)
-│   └── utils/
-│       ├── fps_counter.py     # Performance monitoring
-│       └── logger.py          # Event logging (planned)
+│   │   └── tts_output.py      # Text-to-speech engine
+│   ├── utils/
+│   │   ├── logger.py          # File + console logging
+│   │   ├── async_processor.py # Background thread manager
+│   │   └── fps_counter.py     # Performance monitoring
+│   └── logic/
+│       ├── output_generator.py # Natural language generation
+│       └── command_processor.py # Command parsing (planned)
+│    
 ├── tests/
 │   ├── test_camera.py
 │   ├── test_detector.py
@@ -195,7 +196,9 @@ synapse-prototype/
 ├── config.yaml                # Configuration file
 ├── main.py                    # Main orchestrator
 ├── requirements.txt           # Dependencies
-└── README.md                  # This file
+├── README.md                  # This file\
+├── logs/                      # Auto-generated session logs
+└── assets/                    # Test images/videos
 ```
 
 ---
@@ -250,9 +253,15 @@ python test_caption.py
 - [x] Unified interface
 
 ### Phase 2: Optimization (In Progress)
+- [x] Improved tracking stability
+- [x] Distance estimation (monocular, no depth sensor)
+- [x] Spatial awareness (left/ahead/right zones)
+- [x] Scene memory & change detection
+- [x] Background threading (non-blocking OCR + captioning)
+- [x] Frame skipping for CPU optimization
+- [x] Session logging with FPS + CPU monitoring
 - [ ] Model quantization (TFLite INT8)
 - [ ] Raspberry Pi 4 deployment
-- [ ] Improved tracking stability
 - [ ] IMU integration for power management
 - [ ] Wake-word activation
 

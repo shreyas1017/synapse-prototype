@@ -6,296 +6,461 @@ CONTROLS:
 - 'w' : What's ahead? (Detection summary with audio)
 - 'd' : Describe scene (BLIP captioning)
 - 'r' : Read text (OCR)
-- 't' : Toggle tracking warnings (continuous vs on-demand)
+- 't' : Toggle tracking warnings
 - 'q' : Quit
-
-Author: Your Team
-Date: December 2025
 """
 
 import cv2
 import yaml
 import time
+import suppress_warnings
 from src.io.camera import CameraCapture
-from src.vision.detector import YOLODetector
-from src.vision.simple_tracker import SimpleTracker as ObjectTracker
+from src.vision.tracker import ByteTracker
 from src.vision.ocr import OCRModule
 from src.vision.captioner import SceneCaptioner
+from src.vision.distance_estimator import DistanceEstimator
+from src.vision.spatial_layout import build_spatial_summary
 from src.io.tts_output import TTSOutput
 from src.logic.output_generator import OutputGenerator
 from src.utils.fps_counter import FPSCounter
-
+from src.utils.logger import logger
+from src.vision.scene_memory import SceneMemory
+from src.utils.async_processor import AsyncProcessor
 
 class SynapseSystem:
     """Main SYNAPSE system orchestrator."""
-    
+
     def __init__(self, config_path: str = 'config.yaml'):
-        """Initialize all system components."""
         print("\n" + "="*60)
-        print("PROJECT SYNAPSE - Assistive Vision System")
+        print("  PROJECT SYNAPSE - Assistive Vision System")
         print("="*60 + "\n")
-        
-        # Load config
+
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        # Initialize components
+
         self._init_camera()
-        self._init_detector()
         self._init_tracker()
         self._init_ocr()
         self._init_captioner()
         self._init_tts()
         self._init_output_generator()
         
-        # System state
-        self.tracking_warnings_enabled = True
-        self.last_warning_time = 0
-        self.warning_cooldown = 3.0  # seconds between warnings
-        
-        # Performance tracking
+
+        # Warning system state
+        warn_cfg = self.config['warnings']
+        self.warnings_enabled = warn_cfg['enabled']
+        self.global_cooldown = warn_cfg['global_cooldown']
+        self.per_track_cooldown = warn_cfg['per_track_cooldown']
+        self.warn_min_confidence = warn_cfg['min_confidence']
+        self.risk_classes = set(warn_cfg['risk_classes'])
+
+        self.last_global_warning_time = 0
+        self.last_warning_per_track = {}
+        self.distance_estimator = DistanceEstimator()
+        self.scene_memory = SceneMemory(memory_duration=5.0)
         self.fps_counter = FPSCounter(avg_over_frames=30)
-        
+        self.frame_count = 0
+        self.last_tracks = []
+        self.async_processor = AsyncProcessor()
+        self.warning_count = 0
+
         print("\n" + "="*60)
-        print("SYNAPSE SYSTEM READY")
+        print("  SYNAPSE READY")
         print("="*60 + "\n")
-    
+
+    # ------------------------------------------------------------------ init
+
     def _init_camera(self):
-        """Initialize camera."""
-        config = self.config['camera']
+        cfg = self.config['camera']
         self.camera = CameraCapture(
-            device_id=config['device_id'],
-            width=config['width'],
-            height=config['height']
+            device_id=cfg['device_id'],
+            width=cfg['width'],
+            height=cfg['height']
         )
         self.camera.start()
-        
-        # Wait for first frame
         for _ in range(50):
             if self.camera.read() is not None:
                 break
             time.sleep(0.1)
-    
-    def _init_detector(self):
-        """Initialize object detector."""
-        config = self.config['detection']
-        self.detector = YOLODetector(
-            model_path=config['model'],
-            device=config['device'],
-            confidence=config['confidence'],
-            iou=config['iou']
-        )
-    
+
     def _init_tracker(self):
-        """Initialize object tracker."""
-        config = self.config['tracking']
-        self.tracker = ObjectTracker(
-            max_age=config['max_age'],
-            min_hits=config['min_hits'],
-            iou_threshold=config['iou_threshold']
+        det = self.config['detection']
+        trk = self.config['tracking']
+        self.tracker = ByteTracker(
+            model_path=det['model'],
+            device=det['device'],
+            confidence=det['confidence'],
+            iou=det['iou'],
+            max_age=trk['max_age']
         )
-    
+
     def _init_ocr(self):
-        """Initialize OCR module."""
-        config = self.config['ocr']
+        cfg = self.config['ocr']
         self.ocr = OCRModule(
-            languages=config['languages'],
-            gpu=config['gpu'],
-            min_confidence=config['min_confidence']
+            languages=cfg['languages'],
+            gpu=cfg['gpu'],
+            min_confidence=cfg['min_confidence']
         )
-    
+
     def _init_captioner(self):
-        """Initialize scene captioner."""
-        config = self.config['captioning']
+        cfg = self.config['captioning']
         self.captioner = SceneCaptioner(
-            model_name=config['model'],
-            device=config['device'],
-            max_length=config['max_length'],
-            min_length=config['min_length']
+            model_name=cfg['model'],
+            device=cfg['device'],
+            max_length=cfg['max_length'],
+            min_length=cfg['min_length']
         )
-    
+
     def _init_tts(self):
-        """Initialize text-to-speech."""
-        config = self.config['tts']
+        cfg = self.config['tts']
         self.tts = TTSOutput(
-            rate=config['rate'],
-            volume=config['volume']
+            rate=cfg['rate'],
+            volume=cfg['volume']
         )
-    
+
     def _init_output_generator(self):
-        """Initialize output generator."""
         self.output_gen = OutputGenerator()
-    
-    def draw_interface(self, frame, detections, tracks):
-        """Draw UI overlay on frame."""
-        display = frame.copy()
-        
-        # Draw tracks
+
+    # -------------------------------------------------------- warning system
+
+    def check_warnings(self, tracks):
+        """
+        Issue warning only when:
+        1. Warnings enabled
+        2. Risk class with high confidence
+        3. Object is approaching
+        4. Object is NOT too close/large (avoids hand false positives)
+        5. Cooldowns respected
+        """
+
+        if not self.warnings_enabled:
+            return
+
+        now = time.time()
+        if now - self.last_global_warning_time < self.global_cooldown:
+            return
+
+        warn_cfg = self.config['warnings']
+        frame_area = self.config['camera']['width'] * self.config['camera']['height']
+        min_ratio = warn_cfg.get('min_bbox_ratio', 0.02)
+        max_ratio = warn_cfg.get('max_bbox_ratio', 0.35)
+
+        candidates = []
         for track in tracks:
-            x1, y1, x2, y2 = track['bbox']
-            track_id = track['track_id']
             class_name = track['class_name']
             direction = track['direction']
-            
-            # Color based on direction
+            confidence = track['confidence']
+            track_id = track['track_id']
+            x1, y1, x2, y2 = track['bbox']
+
+            # Risk class check
+            if class_name not in self.risk_classes:
+                continue
+
+            # Must be consistently approaching
+            if "approaching" not in direction:
+                continue
+
+            # Confidence check
+            if confidence < self.warn_min_confidence:
+                continue
+
+            # Bbox size filter
+            bbox_area = (x2 - x1) * (y2 - y1)
+            bbox_ratio = bbox_area / frame_area
+            if not (min_ratio <= bbox_ratio <= max_ratio):
+                continue
+
+            # Per-track cooldown
+            last_warned = self.last_warning_per_track.get(track_id, 0)
+            if now - last_warned < self.per_track_cooldown:
+                continue
+
+            candidates.append(track)
+
+        if not candidates:
+            return
+
+        # Score = confidence + proximity bonus (closer = higher priority)
+        def priority_score(track):
+            distance = self.distance_estimator.estimate(track['class_name'], track['bbox'])
+            proximity_bonus = (1.0 / distance) if distance and distance > 0 else 0
+            return track['confidence'] + proximity_bonus
+
+        best = max(candidates, key=priority_score)
+        direction = best['direction']
+        class_name = best['class_name']
+
+        distance = self.distance_estimator.estimate(class_name, best['bbox'])
+        dist_str = self.distance_estimator.format_distance(distance)
+
+        if "left" in direction:
+            message = f"Caution! {class_name} approaching from your left"
+        else:
+            message = f"Caution! {class_name} approaching from your right"
+
+        if dist_str:
+            message = f"{message}, {dist_str}"
+
+        logger.info(f"[WARNING] {message}")
+        self.tts.speak(message, blocking=False)
+        self.warning_count += 1
+
+        self.last_global_warning_time = now
+        self.last_warning_per_track[best['track_id']] = now
+
+        self.last_warning_per_track = {
+            tid: t for tid, t in self.last_warning_per_track.items()
+            if now - t < self.per_track_cooldown * 2
+        }
+
+    # --------------------------------------------------------------- display
+
+    def draw_interface(self, frame, tracks):
+        """Draw UI overlay on frame."""
+        import psutil
+        display = frame.copy()
+
+        for track in tracks:
+            x1, y1, x2, y2 = track['bbox']
+            tid = track['track_id']
+            class_name = track['class_name']
+            direction = track['direction']
+            conf = track['confidence']
+
+            # Color by direction
             if "approaching" in direction:
-                color = (0, 0, 255)  # Red
+                color = (0, 0, 255)      # Red
             elif "moving away" in direction:
-                color = (255, 0, 0)  # Blue
+                color = (255, 100, 0)    # Blue
             else:
-                color = (0, 255, 0)  # Green
-            
-            # Draw box
+                color = (0, 255, 0)      # Green
+
+            # Bounding box
             cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw ID
-            label = f"ID:{track_id} {class_name}"
+
+            # Label: ID + class + confidence
+            label = f"ID:{tid} {class_name} {conf:.2f}"
             cv2.putText(display, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
-        # Draw FPS
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # Direction below box
+            cv2.putText(display, direction, (x1, y2 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        # Stats
         fps = self.fps_counter.get_fps()
-        cv2.putText(display, f"FPS: {fps:.1f}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Draw object count
+        cpu = psutil.cpu_percent()
+        warn_status = "ON" if self.warnings_enabled else "OFF"
+
+        cv2.putText(display, f"FPS: {fps:.1f}  CPU: {cpu:.0f}%", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(display, f"Objects: {len(tracks)}", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Draw controls
-        y_offset = frame.shape[0] - 120
-        controls = [
-            "CONTROLS:",
-            "W - What's ahead?",
-            "D - Describe scene",
-            "R - Read text",
-            "T - Toggle warnings",
-            "Q - Quit"
-        ]
-        
-        for i, text in enumerate(controls):
-            cv2.putText(display, text, (10, y_offset + i * 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # Warning status
-        warning_status = "ON" if self.tracking_warnings_enabled else "OFF"
-        cv2.putText(display, f"Warnings: {warning_status}", (10, 90),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display, f"Warnings: {warn_status}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # Async processing indicator
+        if self.async_processor.is_running:
+            cv2.putText(display, "Processing...", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+        # Controls
+        controls = ["W-Whats ahead", "D-Describe", "R-Read text",
+                    "T-Toggle warns", "Q-Quit"]
+        for i, ctrl in enumerate(controls):
+            cv2.putText(display, ctrl,
+                        (10, frame.shape[0] - 110 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (255, 255, 255), 1)
+
         return display
     
-    def check_approaching_warnings(self, tracks):
-        """Check for approaching objects and issue warnings."""
-        if not self.tracking_warnings_enabled:
-            return
-        
-        current_time = time.time()
-        if current_time - self.last_warning_time < self.warning_cooldown:
-            return
-        
-        # Find approaching objects
-        approaching = [t for t in tracks if "approaching" in t['direction']]
-        
-        if len(approaching) > 0:
-            warning = self.output_gen.describe_tracks(tracks)
-            print(f"[WARNING] {warning}")
-            self.tts.speak(warning, blocking=False)
-            self.last_warning_time = current_time
-    
+    def print_session_summary(self, session_start: float):
+        """Print a summary of what was detected during the session."""
+        import time
+        duration = time.time() - session_start
+        minutes = int(duration // 60)
+        seconds = int(duration % 60)
+
+        # Collect all unique classes ever tracked
+        seen_classes = set()
+        for tid, history in self.tracker.track_history.items():
+            pass  # track_history stores positions, not classes
+
+        logger.info("\n" + "=" * 60)
+        logger.info("  SESSION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"  Duration        : {minutes}m {seconds}s")
+        logger.info(f"  Total warnings  : {self.warning_count}")
+        logger.info(f"  Log saved to    : logs/")
+        logger.info("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------ run
+
     def run(self):
         """Main system loop."""
-        print("\n=== SYNAPSE CONTROLS ===")
-        print("W - What's ahead? (Detection summary)")
-        print("D - Describe scene (BLIP captioning)")
-        print("R - Read text (OCR)")
-        print("T - Toggle tracking warnings")
-        print("Q - Quit")
-        print("="*40 + "\n")
+        print("=== CONTROLS ===")
+        print("W - What's ahead?")
+        print("D - Describe scene")
+        print("R - Read text")
+        print("T - Toggle warnings")
+        print("Q - Quit\n")
         
+        session_start = time.time()
         while True:
-            # Read frame
             frame = self.camera.read()
             if frame is None:
                 continue
-            
-            # Run detection
-            detections = self.detector.detect(frame, verbose=False)
-            
-            # Update tracker
-            tracks = self.tracker.update(detections, frame)
-            
-            # Check for warnings
-            self.check_approaching_warnings(tracks)
-            
-            # Update FPS
+
+            # Track
+            # Frame skipping — run YOLO every Nth frame
+            self.frame_count += 1
+            frame_skip = self.config['camera'].get('frame_skip', 2)
+
+            if self.frame_count % frame_skip == 0:
+                self.last_tracks = self.tracker.track(frame)
+
+            tracks = self.last_tracks
+
+            # Check warnings
+            self.check_warnings(tracks)
+
+            # FPS
             self.fps_counter.update()
-            
-            # Draw interface
-            display = self.draw_interface(frame, detections, tracks)
-            
-            # Show
+
+            # Draw
+            display = self.draw_interface(frame, tracks)
             cv2.imshow("SYNAPSE - Assistive Vision System", display)
-            
-            # Handle commands
+
+            # Commands
             key = cv2.waitKey(1) & 0xFF
-            
+
             if key == ord('q'):
-                print("\n[SYSTEM] Shutting down...")
+                logger.info("\n[SYSTEM] Shutting down...")
+                self.print_session_summary(session_start)
                 break
-            
+
             elif key == ord('w'):
-                # What's ahead?
-                print("\n[USER] What's ahead?")
-                description = self.output_gen.describe_tracks(tracks)
-                print(f"[SYSTEM] {description}")
-                self.tts.speak(description, blocking=False)
-            
+                logger.info("\n[USER] What's ahead?")
+
+                if not tracks:
+                    # Check if something recently disappeared
+                    changes = self.scene_memory.get_changes(
+                        [], self.config['camera']['width'], self.distance_estimator
+                    )
+                    if changes["gone"]:
+                        gone_labels = ", ".join([g[0] for g in changes["gone"]])
+                        summary = f"Path now clear. {gone_labels} no longer detected."
+                    else:
+                        summary = "Path appears clear."
+
+                    logger.info(f"[SYSTEM] {summary}")
+                    self.tts.speak(summary, blocking=False)
+                    self.scene_memory.update([], self.config['camera']['width'], self.distance_estimator)
+
+                else:
+                    changes = self.scene_memory.get_changes(
+                        tracks, self.config['camera']['width'], self.distance_estimator
+                    )
+
+                    parts = []
+
+                    # New objects — highest priority
+                    for label, zone, dist in changes["new"]:
+                        dist_str = self.distance_estimator.format_distance(dist)
+                        zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
+                        parts.append(f"New: {label} {zone_str}, {dist_str}")
+
+                    # Closer objects — second priority
+                    for label, zone, dist in changes["closer"]:
+                        dist_str = self.distance_estimator.format_distance(dist)
+                        zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
+                        parts.append(f"{label} moving closer, now {dist_str} {zone_str}")
+
+                    # Same objects — only if nothing new/closer
+                    if not parts:
+                        for label, zone, dist in changes["same"]:
+                            dist_str = self.distance_estimator.format_distance(dist)
+                            zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
+                            parts.append(f"{label} {zone_str}, {dist_str}")
+
+                    # Gone objects — append at end
+                    for label, zone in changes["gone"]:
+                        parts.append(f"{label} no longer detected")
+
+                    summary = ". ".join(parts) + "."
+                    logger.info(f"[SYSTEM] {summary}")
+                    self.tts.speak(summary, blocking=False)
+
+                    # Update memory after reporting
+                    self.scene_memory.update(
+                        tracks, self.config['camera']['width'], self.distance_estimator
+                    )
+
             elif key == ord('d'):
-                # Describe scene
-                print("\n[USER] Describe scene")
-                self.tts.speak("Analyzing scene", blocking=False)
-                
-                caption = self.captioner.generate_caption(frame, verbose=False)
-                formatted = self.output_gen.format_caption(caption)
-                
-                print(f"[SYSTEM] {formatted}")
-                self.tts.speak(formatted, blocking=False)
-            
+                if self.async_processor.is_running:
+                    self.tts.speak("Still analyzing, please wait", blocking=False)
+                else:
+                    logger.info("\n[USER] Describe scene")
+                    self.tts.speak("Analyzing scene", blocking=False)
+                    current_frame = frame.copy()
+                    current_tracks = tracks.copy()
+
+                    def describe_task():
+                        caption = self.captioner.generate_caption(current_frame, verbose=False)
+                        formatted = self.output_gen.format_caption(caption)
+                        spatial = build_spatial_summary(
+                            current_tracks,
+                            self.config['camera']['width'],
+                            self.distance_estimator
+                        )
+                        return f"{formatted}. {spatial}" if current_tracks else formatted
+
+                    def on_done(result):
+                        logger.info(f"[SYSTEM] {result}")
+                        self.tts.speak(result, blocking=False)
+
+                    self.async_processor.run(describe_task, callback=on_done)
+
             elif key == ord('r'):
-                # Read text
-                print("\n[USER] Read text")
-                self.tts.speak("Reading text", blocking=False)
-                
-                text, _ = self.ocr.extract_text(frame, verbose=False)
-                formatted = self.output_gen.format_ocr_result(text)
-                
-                print(f"[SYSTEM] {formatted}")
-                self.tts.speak(formatted, blocking=False)
-            
+                if self.async_processor.is_running:
+                    self.tts.speak("Still reading, please wait", blocking=False)
+                else:
+                    logger.info("\n[USER] Read text")
+                    self.tts.speak("Reading text", blocking=False)
+                    current_frame = frame.copy()
+
+                    def ocr_task():
+                        text, _ = self.ocr.extract_text(current_frame, verbose=False)
+                        return self.output_gen.format_ocr_result(text)
+
+                    def on_done(result):
+                        logger.info(f"[SYSTEM] {result}")
+                        self.tts.speak(result, blocking=False)
+
+                    self.async_processor.run(ocr_task, callback=on_done)
+
             elif key == ord('t'):
-                # Toggle warnings
-                self.tracking_warnings_enabled = not self.tracking_warnings_enabled
-                status = "enabled" if self.tracking_warnings_enabled else "disabled"
-                print(f"\n[SYSTEM] Tracking warnings {status}")
+                self.warnings_enabled = not self.warnings_enabled
+                status = "enabled" if self.warnings_enabled else "disabled"
+                logger.info(f"\n[SYSTEM] Warnings {status}")
                 self.tts.speak(f"Warnings {status}", blocking=False)
-        
+
         # Cleanup
         self.camera.stop()
         cv2.destroyAllWindows()
-        
-        print("\n[SYSTEM] SYNAPSE shutdown complete")
-        print("="*60 + "\n")
+        print("\n[SYSTEM] SYNAPSE shutdown complete\n")
 
 
 def main():
-    """Entry point."""
     try:
         system = SynapseSystem()
         system.run()
     except KeyboardInterrupt:
-        print("\n\n[SYSTEM] Interrupted by user")
+        print("\n[SYSTEM] Interrupted")
     except Exception as e:
-        print(f"\n[ERROR] {e}")
+        logger.info(f"\n[ERROR] {e}")
         import traceback
         traceback.print_exc()
 

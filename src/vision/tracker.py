@@ -1,172 +1,202 @@
 """
-SORT-based object tracker with trajectory prediction.
+ByteTrack-based object tracker using Ultralytics built-in tracking.
+Replaces SimpleTracker and DeepSORT for better ID stability.
 """
 
-from deep_sort_realtime.deepsort_tracker import DeepSort
+import cv2
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from ultralytics import YOLO
+from typing import List, Dict
 
 
-class ObjectTracker:
-    """Wrapper for DeepSORT tracking with trajectory analysis."""
-    
-    def __init__(self, max_age: int = 5, min_hits: int = 3, iou_threshold: float = 0.3):
+class ByteTracker:
+    """
+    Wrapper around Ultralytics ByteTrack for stable multi-object tracking.
+    Uses model.track() instead of model.predict() for built-in tracking.
+    """
+
+    def __init__(self, model_path: str = "yolo11n.pt", device: str = "cpu",
+                 confidence: float = 0.35, iou: float = 0.4,
+                 max_age: int = 30):
         """
-        Initialize tracker.
-        
+        Initialize ByteTracker.
+
         Args:
+            model_path: Path to YOLO model weights
+            device: 'cpu' or 'cuda'
+            confidence: Detection confidence threshold
+            iou: IoU threshold for NMS
             max_age: Frames to keep track alive without detection
-            min_hits: Minimum detections before track is confirmed
-            iou_threshold: IoU threshold for matching
         """
+        self.model_path = model_path
+        self.device = device
+        self.confidence = confidence
+        self.iou = iou
         self.max_age = max_age
-        self.min_hits = min_hits
-        self.iou_threshold = iou_threshold
-        
-        # Initialize DeepSORT
-        self.tracker = DeepSort(
-            max_age=max_age,
-            n_init=min_hits,
-            nms_max_overlap=1.0,
-            max_cosine_distance=0.3,
-            nn_budget=None,
-            override_track_class=None,
-            embedder="mobilenet",
-            half=False,
-            bgr=True,
-            embedder_gpu=False
-        )
-        
-        # Track history for trajectory prediction
-        self.track_history = {}  # track_id -> list of (frame_num, x_center, y_center)
+        self.direction_history = {}
+
+        print(f"[BYTETRACK] Loading model: {model_path}")
+        self.model = YOLO(model_path)
+
+        # Track history for direction prediction
+        self.track_history = {}  # track_id -> list of (frame_num, cx, cy)
         self.frame_count = 0
-        
-        print(f"[TRACKER] Initialized with max_age={max_age}, min_hits={min_hits}")
-    
-    def update(self, detections: List[Dict], frame: np.ndarray) -> List[Dict]:
+
+        print(f"[BYTETRACK] Initialized on {device}")
+
+    def track(self, frame: np.ndarray) -> List[Dict]:
         """
-        Update tracker with new detections.
-        
+        Run detection + tracking on a frame.
+
         Args:
-            detections: List of detections from YOLODetector.detect()
-            frame: Current frame (for embedding extraction)
-            
+            frame: Input image (BGR format from OpenCV)
+
         Returns:
-            List of tracks with IDs and trajectory info
+            List of confirmed tracks, each containing:
+                - track_id, bbox, center, class_name, confidence, direction
         """
         self.frame_count += 1
-        
-        # Convert detections to DeepSORT format
-        # Format: [[x1, y1, x2, y2, confidence, class_id], ...]
-        raw_detections = []
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-            conf = det['confidence']
-            cls = det['class_id']
-            raw_detections.append(([x1, y1, x2, y2], conf, cls))
-        
-        # Update tracker
-        tracks = self.tracker.update_tracks(raw_detections, frame=frame)
-        
-        # Process tracks
+
+        # Run ByteTrack via Ultralytics
+        results = self.model.track(
+            frame,
+            conf=self.confidence,
+            iou=self.iou,
+            tracker="bytetrack.yaml",
+            persist=True,        # Crucial: maintains track IDs across frames
+            verbose=False,
+            device=self.device
+        )
+
         confirmed_tracks = []
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-            
-            track_id = track.track_id
-            ltrb = track.to_ltrb()  # [left, top, right, bottom]
-            
-            # Calculate center
-            x_center = int((ltrb[0] + ltrb[2]) / 2)
-            y_center = int((ltrb[1] + ltrb[3]) / 2)
-            
-            # Update history
-            if track_id not in self.track_history:
-                self.track_history[track_id] = []
-            
-            self.track_history[track_id].append((self.frame_count, x_center, y_center))
-            
-            # Keep only last 10 positions
-            if len(self.track_history[track_id]) > 10:
-                self.track_history[track_id].pop(0)
-            
-            # Predict direction
-            direction = self._predict_direction(track_id, x_center, frame.shape[1])
-            
-            # Get class name from original detection
-            class_name = "unknown"
-            for det in detections:
-                det_center_x = (det['bbox'][0] + det['bbox'][2]) / 2
-                det_center_y = (det['bbox'][1] + det['bbox'][3]) / 2
-                
-                # Match by center proximity
-                if abs(det_center_x - x_center) < 50 and abs(det_center_y - y_center) < 50:
-                    class_name = det['class_name']
-                    break
-            
-            confirmed_tracks.append({
-                'track_id': track_id,
-                'bbox': [int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])],
-                'center': (x_center, y_center),
-                'class_name': class_name,
-                'direction': direction,
-                'age': len(self.track_history[track_id])
-            })
-        
+
+        if results and results[0].boxes is not None:
+            boxes = results[0].boxes
+
+            # Only process if tracking IDs exist
+            if boxes.id is not None:
+                for i in range(len(boxes)):
+                    # Extract data
+                    track_id = int(boxes.id[i].item())
+                    x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().astype(int)
+                    conf = float(boxes.conf[i].item())
+                    cls_id = int(boxes.cls[i].item())
+                    class_name = self.model.names[cls_id]
+
+                    # Calculate center
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+
+                    # Update history
+                    if track_id not in self.track_history:
+                        self.track_history[track_id] = []
+
+                    self.track_history[track_id].append(
+                        (self.frame_count, cx, cy)
+                    )
+
+                    # Keep last 15 positions
+                    if len(self.track_history[track_id]) > 15:
+                        self.track_history[track_id].pop(0)
+
+                    # Predict direction
+                    direction = self._predict_direction(
+                        track_id, cx, frame.shape[1]
+                    )
+                    if track_id not in self.direction_history:
+                        self.direction_history[track_id] = []
+                    self.direction_history[track_id].append(direction)
+                    if len(self.direction_history[track_id]) > 8:
+                        self.direction_history[track_id].pop(0)
+                        
+                    stable_direction = self._get_stable_direction(track_id, direction)
+
+                    confirmed_tracks.append({
+                        'track_id': track_id,
+                        'bbox': [x1, y1, x2, y2],
+                        'center': (cx, cy),
+                        'class_name': class_name,
+                        'confidence': conf,
+                        'direction': stable_direction
+                    })
+
+        # Cleanup old tracks
+        self._cleanup_old_tracks(confirmed_tracks)
+
         return confirmed_tracks
-    
-    def _predict_direction(self, track_id: int, current_x: int, frame_width: int) -> str:
+
+    def _get_stable_direction(self, track_id: int, current_direction: str) -> str:
         """
-        Predict movement direction based on track history.
-        
-        Args:
-            track_id: Track ID
-            current_x: Current x-center position
-            frame_width: Frame width for relative position
-            
+        Return direction only if it has been consistent for majority of recent frames.
+        Prevents single-frame direction flips from triggering warnings.
+        """
+        history = self.direction_history.get(track_id, [])
+
+        if len(history) < 5:
+            return current_direction
+
+        # Count occurrences of each direction in recent history
+        from collections import Counter
+        counts = Counter(history)
+        most_common, count = counts.most_common(1)[0]
+
+        # Only return a direction if it dominates (>60% of recent frames)
+        if count / len(history) >= 0.6:
+            return most_common
+        else:
+            return "stationary"  # Treat inconsistent movement as stationary
+
+
+    def _predict_direction(self, track_id: int, current_x: int,
+                           frame_width: int) -> str:
+        """
+        Predict movement direction from track history.
+
         Returns:
-            Direction string: "approaching from left", "approaching from right", 
-                             "moving away left", "moving away right", "stationary"
+            One of: 'approaching from left', 'approaching from right',
+                    'moving away left', 'moving away right',
+                    'stationary', 'tracking'
         """
-        if track_id not in self.track_history or len(self.track_history[track_id]) < 3:
+        history = self.track_history.get(track_id, [])
+
+        if len(history) < 5:  # Need at least 5 frames for reliable prediction
             return "tracking"
-        
-        history = self.track_history[track_id]
-        
-        # Get positions from 3 frames ago and current
-        old_frame, old_x, old_y = history[0]
-        new_frame, new_x, new_y = history[-1]
-        
-        # Calculate displacement
+
+        # Use first and last position in history window
+        _, old_x, _ = history[0]
+        _, new_x, _ = history[-1]
+
         dx = new_x - old_x
         frame_center = frame_width / 2
-        
-        # Determine relative position
-        position = "left" if current_x < frame_center else "right"
-        
-        # Movement threshold (in pixels)
-        movement_threshold = 20
-        
-        if abs(dx) < movement_threshold:
+        threshold = 15  # Minimum pixel movement to count as motion
+
+        if abs(dx) < threshold:
             return "stationary"
         elif dx > 0:  # Moving right
-            if current_x < frame_center:
-                return f"approaching from left"
-            else:
-                return f"moving away right"
+            return "approaching from left" if current_x < frame_center else "moving away right"
         else:  # Moving left
-            if current_x > frame_center:
-                return f"approaching from right"
-            else:
-                return f"moving away left"
-    
+            return "approaching from right" if current_x > frame_center else "moving away left"
+
+    def _cleanup_old_tracks(self, current_tracks):
+        active_ids = {t['track_id'] for t in current_tracks}
+        stale_ids = [
+            tid for tid in self.track_history
+            if tid not in active_ids
+        ]
+        for tid in stale_ids:
+            history = self.track_history[tid]
+            if self.frame_count - history[-1][0] > self.max_age:
+                del self.track_history[tid]
+                # Also clean direction history
+                self.direction_history.pop(tid, None)
+
+
     def get_track_count(self) -> int:
         """Get number of active tracks."""
         return len(self.track_history)
-    
+
     def reset(self):
         """Reset tracker state."""
         self.track_history = {}
         self.frame_count = 0
-        print("[TRACKER] Reset")
+        print("[BYTETRACK] Reset")

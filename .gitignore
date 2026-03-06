@@ -62,6 +62,7 @@ ocr_capture_*.jpg
 ocr_result_*.jpg
 
 # Logs
+logs/
 *.log
 synapse.log
 
