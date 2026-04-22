@@ -2,6 +2,7 @@
 SYNAPSE: Real-Time Embedded Vision System for Assistive Navigation
 Main orchestrator integrating all modules.
 
+
 CONTROLS:
 - 'w' : What's ahead? (Detection summary with audio)
 - 'd' : Describe scene (BLIP captioning)
@@ -9,6 +10,7 @@ CONTROLS:
 - 't' : Toggle tracking warnings
 - 'q' : Quit
 """
+
 
 import cv2
 import yaml
@@ -22,21 +24,26 @@ from src.vision.distance_estimator import DistanceEstimator
 from src.vision.spatial_layout import build_spatial_summary
 from src.io.tts_output import TTSOutput
 from src.logic.output_generator import OutputGenerator
+from src.logic.command_processor import CommandProcessor, CommandContext
 from src.utils.fps_counter import FPSCounter
 from src.utils.logger import logger
 from src.vision.scene_memory import SceneMemory
 from src.utils.async_processor import AsyncProcessor
 
+
 class SynapseSystem:
     """Main SYNAPSE system orchestrator."""
+
 
     def __init__(self, config_path: str = 'config.yaml'):
         print("\n" + "="*60)
         print("  PROJECT SYNAPSE - Assistive Vision System")
         print("="*60 + "\n")
 
+
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
+
 
         self._init_camera()
         self._init_tracker()
@@ -44,7 +51,8 @@ class SynapseSystem:
         self._init_captioner()
         self._init_tts()
         self._init_output_generator()
-        
+        self._init_command_processor()
+
 
         # Warning system state
         warn_cfg = self.config['warnings']
@@ -53,6 +61,7 @@ class SynapseSystem:
         self.per_track_cooldown = warn_cfg['per_track_cooldown']
         self.warn_min_confidence = warn_cfg['min_confidence']
         self.risk_classes = set(warn_cfg['risk_classes'])
+
 
         self.last_global_warning_time = 0
         self.last_warning_per_track = {}
@@ -64,11 +73,14 @@ class SynapseSystem:
         self.async_processor = AsyncProcessor()
         self.warning_count = 0
 
+
         print("\n" + "="*60)
         print("  SYNAPSE READY")
         print("="*60 + "\n")
 
+
     # ------------------------------------------------------------------ init
+
 
     def _init_camera(self):
         cfg = self.config['camera']
@@ -83,6 +95,7 @@ class SynapseSystem:
                 break
             time.sleep(0.1)
 
+
     def _init_tracker(self):
         det = self.config['detection']
         trk = self.config['tracking']
@@ -94,6 +107,7 @@ class SynapseSystem:
             max_age=trk['max_age']
         )
 
+
     def _init_ocr(self):
         cfg = self.config['ocr']
         self.ocr = OCRModule(
@@ -101,6 +115,7 @@ class SynapseSystem:
             gpu=cfg['gpu'],
             min_confidence=cfg['min_confidence']
         )
+
 
     def _init_captioner(self):
         cfg = self.config['captioning']
@@ -111,6 +126,7 @@ class SynapseSystem:
             min_length=cfg['min_length']
         )
 
+
     def _init_tts(self):
         cfg = self.config['tts']
         self.tts = TTSOutput(
@@ -118,10 +134,17 @@ class SynapseSystem:
             volume=cfg['volume']
         )
 
+
     def _init_output_generator(self):
         self.output_gen = OutputGenerator()
 
+
+    def _init_command_processor(self):
+        self.cmd_processor = CommandProcessor()
+
+
     # -------------------------------------------------------- warning system
+
 
     def check_warnings(self, tracks):
         """
@@ -133,17 +156,21 @@ class SynapseSystem:
         5. Cooldowns respected
         """
 
+
         if not self.warnings_enabled:
             return
+
 
         now = time.time()
         if now - self.last_global_warning_time < self.global_cooldown:
             return
 
+
         warn_cfg = self.config['warnings']
         frame_area = self.config['camera']['width'] * self.config['camera']['height']
         min_ratio = warn_cfg.get('min_bbox_ratio', 0.02)
         max_ratio = warn_cfg.get('max_bbox_ratio', 0.35)
+
 
         candidates = []
         for track in tracks:
@@ -153,17 +180,21 @@ class SynapseSystem:
             track_id = track['track_id']
             x1, y1, x2, y2 = track['bbox']
 
+
             # Risk class check
             if class_name not in self.risk_classes:
                 continue
+
 
             # Must be consistently approaching
             if "approaching" not in direction:
                 continue
 
+
             # Confidence check
             if confidence < self.warn_min_confidence:
                 continue
+
 
             # Bbox size filter
             bbox_area = (x2 - x1) * (y2 - y1)
@@ -171,15 +202,19 @@ class SynapseSystem:
             if not (min_ratio <= bbox_ratio <= max_ratio):
                 continue
 
+
             # Per-track cooldown
             last_warned = self.last_warning_per_track.get(track_id, 0)
             if now - last_warned < self.per_track_cooldown:
                 continue
 
+
             candidates.append(track)
+
 
         if not candidates:
             return
+
 
         # Score = confidence + proximity bonus (closer = higher priority)
         def priority_score(track):
@@ -187,39 +222,49 @@ class SynapseSystem:
             proximity_bonus = (1.0 / distance) if distance and distance > 0 else 0
             return track['confidence'] + proximity_bonus
 
+
         best = max(candidates, key=priority_score)
         direction = best['direction']
         class_name = best['class_name']
 
+
         distance = self.distance_estimator.estimate(class_name, best['bbox'])
         dist_str = self.distance_estimator.format_distance(distance)
+
 
         if "left" in direction:
             message = f"Caution! {class_name} approaching from your left"
         else:
             message = f"Caution! {class_name} approaching from your right"
 
+
         if dist_str:
             message = f"{message}, {dist_str}"
+
 
         logger.info(f"[WARNING] {message}")
         self.tts.speak(message, blocking=False)
         self.warning_count += 1
 
+
         self.last_global_warning_time = now
         self.last_warning_per_track[best['track_id']] = now
+
 
         self.last_warning_per_track = {
             tid: t for tid, t in self.last_warning_per_track.items()
             if now - t < self.per_track_cooldown * 2
         }
 
+
     # --------------------------------------------------------------- display
+
 
     def draw_interface(self, frame, tracks):
         """Draw UI overlay on frame."""
         import psutil
         display = frame.copy()
+
 
         for track in tracks:
             x1, y1, x2, y2 = track['bbox']
@@ -227,6 +272,7 @@ class SynapseSystem:
             class_name = track['class_name']
             direction = track['direction']
             conf = track['confidence']
+
 
             # Color by direction
             if "approaching" in direction:
@@ -236,22 +282,27 @@ class SynapseSystem:
             else:
                 color = (0, 255, 0)      # Green
 
+
             # Bounding box
             cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+
 
             # Label: ID + class + confidence
             label = f"ID:{tid} {class_name} {conf:.2f}"
             cv2.putText(display, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+
             # Direction below box
             cv2.putText(display, direction, (x1, y2 + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
 
         # Stats
         fps = self.fps_counter.get_fps()
         cpu = psutil.cpu_percent()
         warn_status = "ON" if self.warnings_enabled else "OFF"
+
 
         cv2.putText(display, f"FPS: {fps:.1f}  CPU: {cpu:.0f}%", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -260,10 +311,12 @@ class SynapseSystem:
         cv2.putText(display, f"Warnings: {warn_status}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
+
         # Async processing indicator
         if self.async_processor.is_running:
             cv2.putText(display, "Processing...", (10, 120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
 
         # Controls
         controls = ["W-Whats ahead", "D-Describe", "R-Read text",
@@ -274,8 +327,34 @@ class SynapseSystem:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (255, 255, 255), 1)
 
+
         return display
-    
+
+
+    # --------------------------------------------------------- context build
+
+
+    def _build_context(self, key: int, frame, tracks) -> CommandContext:
+        """Package all live state into a CommandContext for the processor."""
+        return CommandContext(
+            key=key,
+            frame=frame,
+            tracks=tracks,
+            tts=self.tts,
+            output_gen=self.output_gen,
+            async_proc=self.async_processor,
+            scene_memory=self.scene_memory,
+            captioner=self.captioner,
+            ocr=self.ocr,
+            distance_est=self.distance_estimator,
+            frame_width=self.config['camera']['width'],
+            warnings_enabled=self.warnings_enabled,
+        )
+
+
+    # -------------------------------------------------------- session summary
+
+
     def print_session_summary(self, session_start: float):
         """Print a summary of what was detected during the session."""
         import time
@@ -283,10 +362,12 @@ class SynapseSystem:
         minutes = int(duration // 60)
         seconds = int(duration % 60)
 
+
         # Collect all unique classes ever tracked
         seen_classes = set()
         for tid, history in self.tracker.track_history.items():
             pass  # track_history stores positions, not classes
+
 
         logger.info("\n" + "=" * 60)
         logger.info("  SESSION SUMMARY")
@@ -296,7 +377,9 @@ class SynapseSystem:
         logger.info(f"  Log saved to    : logs/")
         logger.info("=" * 60 + "\n")
 
+
     # ------------------------------------------------------------------ run
+
 
     def run(self):
         """Main system loop."""
@@ -306,151 +389,61 @@ class SynapseSystem:
         print("R - Read text")
         print("T - Toggle warnings")
         print("Q - Quit\n")
-        
+
         session_start = time.time()
         while True:
             frame = self.camera.read()
             if frame is None:
                 continue
 
-            # Track
+
             # Frame skipping — run YOLO every Nth frame
             self.frame_count += 1
             frame_skip = self.config['camera'].get('frame_skip', 2)
 
+
             if self.frame_count % frame_skip == 0:
                 self.last_tracks = self.tracker.track(frame)
 
+
             tracks = self.last_tracks
+
 
             # Check warnings
             self.check_warnings(tracks)
 
+
             # FPS
             self.fps_counter.update()
+
 
             # Draw
             display = self.draw_interface(frame, tracks)
             cv2.imshow("SYNAPSE - Assistive Vision System", display)
 
+
             # Commands
             key = cv2.waitKey(1) & 0xFF
+            if key == 0xFF:
+                continue
 
-            if key == ord('q'):
-                logger.info("\n[SYSTEM] Shutting down...")
+
+            ctx = self._build_context(key, frame, tracks)
+            result = self.cmd_processor.handle(ctx)
+
+            # Sync warnings toggle back from result
+            self.warnings_enabled = result.warnings_enabled
+
+            if result.should_quit:
                 self.print_session_summary(session_start)
                 break
 
-            elif key == ord('w'):
-                logger.info("\n[USER] What's ahead?")
-
-                if not tracks:
-                    # Check if something recently disappeared
-                    changes = self.scene_memory.get_changes(
-                        [], self.config['camera']['width'], self.distance_estimator
-                    )
-                    if changes["gone"]:
-                        gone_labels = ", ".join([g[0] for g in changes["gone"]])
-                        summary = f"Path now clear. {gone_labels} no longer detected."
-                    else:
-                        summary = "Path appears clear."
-
-                    logger.info(f"[SYSTEM] {summary}")
-                    self.tts.speak(summary, blocking=False)
-                    self.scene_memory.update([], self.config['camera']['width'], self.distance_estimator)
-
-                else:
-                    changes = self.scene_memory.get_changes(
-                        tracks, self.config['camera']['width'], self.distance_estimator
-                    )
-
-                    parts = []
-
-                    # New objects — highest priority
-                    for label, zone, dist in changes["new"]:
-                        dist_str = self.distance_estimator.format_distance(dist)
-                        zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
-                        parts.append(f"New: {label} {zone_str}, {dist_str}")
-
-                    # Closer objects — second priority
-                    for label, zone, dist in changes["closer"]:
-                        dist_str = self.distance_estimator.format_distance(dist)
-                        zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
-                        parts.append(f"{label} moving closer, now {dist_str} {zone_str}")
-
-                    # Same objects — only if nothing new/closer
-                    if not parts:
-                        for label, zone, dist in changes["same"]:
-                            dist_str = self.distance_estimator.format_distance(dist)
-                            zone_str = "ahead" if zone == "ahead" else f"to your {zone}"
-                            parts.append(f"{label} {zone_str}, {dist_str}")
-
-                    # Gone objects — append at end
-                    for label, zone in changes["gone"]:
-                        parts.append(f"{label} no longer detected")
-
-                    summary = ". ".join(parts) + "."
-                    logger.info(f"[SYSTEM] {summary}")
-                    self.tts.speak(summary, blocking=False)
-
-                    # Update memory after reporting
-                    self.scene_memory.update(
-                        tracks, self.config['camera']['width'], self.distance_estimator
-                    )
-
-            elif key == ord('d'):
-                if self.async_processor.is_running:
-                    self.tts.speak("Still analyzing, please wait", blocking=False)
-                else:
-                    logger.info("\n[USER] Describe scene")
-                    self.tts.speak("Analyzing scene", blocking=False)
-                    current_frame = frame.copy()
-                    current_tracks = tracks.copy()
-
-                    def describe_task():
-                        caption = self.captioner.generate_caption(current_frame, verbose=False)
-                        formatted = self.output_gen.format_caption(caption)
-                        spatial = build_spatial_summary(
-                            current_tracks,
-                            self.config['camera']['width'],
-                            self.distance_estimator
-                        )
-                        return f"{formatted}. {spatial}" if current_tracks else formatted
-
-                    def on_done(result):
-                        logger.info(f"[SYSTEM] {result}")
-                        self.tts.speak(result, blocking=False)
-
-                    self.async_processor.run(describe_task, callback=on_done)
-
-            elif key == ord('r'):
-                if self.async_processor.is_running:
-                    self.tts.speak("Still reading, please wait", blocking=False)
-                else:
-                    logger.info("\n[USER] Read text")
-                    self.tts.speak("Reading text", blocking=False)
-                    current_frame = frame.copy()
-
-                    def ocr_task():
-                        text, _ = self.ocr.extract_text(current_frame, verbose=False)
-                        return self.output_gen.format_ocr_result(text)
-
-                    def on_done(result):
-                        logger.info(f"[SYSTEM] {result}")
-                        self.tts.speak(result, blocking=False)
-
-                    self.async_processor.run(ocr_task, callback=on_done)
-
-            elif key == ord('t'):
-                self.warnings_enabled = not self.warnings_enabled
-                status = "enabled" if self.warnings_enabled else "disabled"
-                logger.info(f"\n[SYSTEM] Warnings {status}")
-                self.tts.speak(f"Warnings {status}", blocking=False)
 
         # Cleanup
         self.camera.stop()
         cv2.destroyAllWindows()
         print("\n[SYSTEM] SYNAPSE shutdown complete\n")
+
 
 
 def main():
@@ -463,6 +456,7 @@ def main():
         logger.info(f"\n[ERROR] {e}")
         import traceback
         traceback.print_exc()
+
 
 
 if __name__ == "__main__":
