@@ -1,7 +1,6 @@
 """
 Text-to-speech output module using pyttsx3.
 """
-
 import pyttsx3
 import threading
 from typing import Optional
@@ -9,60 +8,58 @@ from typing import Optional
 
 class TTSOutput:
     """Offline text-to-speech engine."""
-    
+
     def __init__(self, rate: int = 150, volume: float = 0.9):
-        """
-        Initialize TTS engine.
-        
-        Args:
-            rate: Speech rate in words per minute
-            volume: Volume level (0.0 to 1.0)
-        """
         self.rate = rate
         self.volume = volume
-        
-        # Thread lock to prevent simultaneous speech
         self.lock = threading.Lock()
-        
+        self._engine = None
+        self._init_engine()
         print(f"[TTS] Initialized: rate={rate}, volume={volume}")
-    
+
+    def _init_engine(self):
+        try:
+            self._engine = pyttsx3.init()
+            self._engine.setProperty('rate', self.rate)
+            self._engine.setProperty('volume', self.volume)
+        except Exception as e:
+            print(f"[TTS] Engine init failed: {e}")
+            self._engine = None
+
     def speak(self, text: str, blocking: bool = True):
-        """
-        Speak text aloud.
-        
-        Args:
-            text: Text to speak
-            blocking: If True, wait for speech to complete. If False, speak in background.
-        """
-        if not text or len(text.strip()) == 0:
+        if not text or not text.strip():
             return
-        
+
         def _speak():
             with self.lock:
-                # Reinitialize engine each time (fixes pyttsx3 one-time issue)
-                engine = pyttsx3.init()
-                engine.setProperty('rate', self.rate)
-                engine.setProperty('volume', self.volume)
-                
-                print(f"[TTS] Speaking: {text}")
-                engine.say(text)
-                engine.runAndWait()
-                engine.stop()
-        
+                try:
+                    if self._engine is None:
+                        self._init_engine()
+                    print(f"[TTS] Speaking: {text}")
+                    self._engine.say(text)
+                    self._engine.runAndWait()
+                except Exception:
+                    # Engine crashed — reinit for next call
+                    self._init_engine()
+
         if blocking:
             _speak()
         else:
-            thread = threading.Thread(target=_speak, daemon=True)
-            thread.start()
-    
-    def stop(self):
-        """Stop current speech."""
-        pass  # Not needed with per-call init
-    
+            threading.Thread(target=_speak, daemon=True).start()
+
     def set_rate(self, rate: int):
-        """Change speech rate."""
         self.rate = rate
-    
+        if self._engine:
+            self._engine.setProperty('rate', rate)
+
     def set_volume(self, volume: float):
-        """Change volume (0.0 to 1.0)."""
         self.volume = volume
+        if self._engine:
+            self._engine.setProperty('volume', volume)
+
+    def stop(self):
+        if self._engine:
+            try:
+                self._engine.stop()
+            except Exception:
+                pass

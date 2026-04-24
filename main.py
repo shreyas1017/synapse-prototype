@@ -231,13 +231,8 @@ class SynapseSystem:
         distance = self.distance_estimator.estimate(class_name, best['bbox'])
         dist_str = self.distance_estimator.format_distance(distance)
 
-
-        if "left" in direction:
-            message = f"Caution! {class_name} approaching from your left"
-        else:
-            message = f"Caution! {class_name} approaching from your right"
-
-
+	side = "left" if "left" in direction else "right"
+        message = f"{class_name}, {side}"
         if dist_str:
             message = f"{message}, {dist_str}"
 

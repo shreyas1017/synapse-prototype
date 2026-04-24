@@ -66,9 +66,9 @@ class OutputGenerator:
             for track in approaching:
                 name = track["class_name"]
                 if "left" in track["direction"]:
-                    warnings.append(f"{name} approaching from your left")
+                    warnings.append(f"{name} left")
                 else:
-                    warnings.append(f"{name} approaching from your right")
+                    warnings.append(f"{name} right")
             if len(warnings) == 1:
                 return f"Caution! {warnings[0]}."
             else:

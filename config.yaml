@@ -8,11 +8,13 @@ camera:
 
 # Detection settings
 detection:
-  model: "yolo11n.pt"
+  model: "yolo26n_ncnn_256"
+  detection_size: 256
   device: "cpu"
   confidence: 0.35
   iou: 0.4
   max_det: 10
+  num_threads: 4
 
 # Tracking settings
 tracking:
@@ -35,22 +37,22 @@ captioning:
 
 # TTS settings
 tts:
-  rate: 150
+  rate: 200
   volume: 0.9
 
 tracker:
-  model: yolo11n.pt
-  confidence: 0.55        # Raised from 0.5 — reduces false positives
+  model: yolo26n.pt
+  confidence: 0.55
   iou_threshold: 0.45
   max_age: 30
-  min_hits: 3             # Object must appear in 3 frames before being tracked
+  min_hits: 3
   device: cpu
 
 warnings:
   enabled: true
   global_cooldown: 3.0
   per_track_cooldown: 4.0
-  min_confidence: 0.65    # Raised from 0.6 — only warn on high confidence
+  min_confidence: 0.65
   min_bbox_ratio: 0.02
   max_bbox_ratio: 0.35
   risk_classes:
